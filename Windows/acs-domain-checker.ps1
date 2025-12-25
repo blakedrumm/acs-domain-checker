@@ -402,7 +402,9 @@ function Get-AcsDnsStatus {
   $dkim  = Get-DnsDkimStatus  -Domain $Domain
   $cname = Get-DnsCnameStatus -Domain $Domain
 
-  $acsReady = (-not $base.dnsFailed) -and $base.spfPresent -and $base.acsPresent
+  # ACS domain verification readiness is primarily based on the ms-domain-verification TXT record.
+  # Other checks (SPF/MX/DMARC/DKIM/CNAME) are useful guidance but not required for ACS verification.
+  $acsReady = (-not $base.dnsFailed) -and $base.acsPresent
 
     # Guidance
     $guidance = New-Object System.Collections.Generic.List[string]
@@ -1174,6 +1176,23 @@ function toggleCard(header) {
   if (content) {
     content.classList.toggle("collapsed");
   }
+
+  // If the MX card is being collapsed, also hide the additional details and reset the button label.
+  const isNowCollapsed = header.classList.contains("collapsed-header") || (content && content.classList.contains("collapsed"));
+  if (isNowCollapsed) {
+    const mxDetails = document.getElementById("mxDetails");
+    if (mxDetails && header.parentElement && header.parentElement.contains(mxDetails)) {
+      mxDetails.style.display = "none";
+      const btns = header.querySelectorAll("button");
+      for (const b of btns) {
+        const t = (b.textContent || "").trim();
+        if (t.startsWith("Additional Details")) {
+          b.textContent = "Additional Details +";
+          break;
+        }
+      }
+    }
+  }
 }
 
 function setStatus(html) {
@@ -1202,6 +1221,8 @@ function buildTestSummaryHtml(r) {
       case "fail": return "tag-fail";
       case "error": return "tag-fail";
       case "pending": return "tag-info";
+      case "optional": return "tag-info";
+      case "unavailable": return "tag-info";
       default: return "tag-info";
     }
   };
@@ -1239,11 +1260,11 @@ function buildTestSummaryHtml(r) {
     add("ACS TXT", "error");
     add("TXT Records", "error");
   } else if (r.dnsFailed) {
-    add("SPF (root TXT)", "fail");
+    add("SPF (root TXT)", "unavailable");
     add("ACS TXT", "fail");
     add("TXT Records", "fail");
   } else {
-    add("SPF (root TXT)", r.spfPresent ? "pass" : "fail");
+    add("SPF (root TXT)", r.spfPresent ? "pass" : "optional");
     add("ACS TXT", r.acsPresent ? "pass" : "fail");
     add("TXT Records", "pass");
   }
@@ -1255,7 +1276,7 @@ function buildTestSummaryHtml(r) {
     add("MX", "error");
   } else {
     const hasMx = Array.isArray(r.mxRecords) && r.mxRecords.length > 0;
-    add("MX", hasMx ? "pass" : "fail");
+    add("MX", hasMx ? "pass" : "optional");
   }
 
   // DMARC
@@ -1264,7 +1285,7 @@ function buildTestSummaryHtml(r) {
   } else if (errors.dmarc) {
     add("DMARC", "error");
   } else {
-    add("DMARC", r.dmarc ? "pass" : "fail");
+    add("DMARC", r.dmarc ? "pass" : "optional");
   }
 
   // DKIM selectors
@@ -1275,8 +1296,8 @@ function buildTestSummaryHtml(r) {
     add("DKIM1", "error");
     add("DKIM2", "error");
   } else {
-    add("DKIM1", r.dkim1 ? "pass" : "fail");
-    add("DKIM2", r.dkim2 ? "pass" : "fail");
+    add("DKIM1", r.dkim1 ? "pass" : "optional");
+    add("DKIM2", r.dkim2 ? "pass" : "optional");
   }
 
   // CNAME
@@ -1285,7 +1306,7 @@ function buildTestSummaryHtml(r) {
   } else if (errors.cname) {
     add("CNAME", "error");
   } else {
-    add("CNAME", r.cname ? "pass" : "fail");
+    add("CNAME", r.cname ? "pass" : "optional");
   }
 
   const pills = checks.map(c => {
@@ -1358,7 +1379,22 @@ function copyField(btn, key) {
     setStatus("Nothing to copy for " + escapeHtml(fieldKey) + ".");
     return;
   }
-  const text = el.innerText || el.textContent || "";
+
+  let text = el.innerText || el.textContent || "";
+
+  // If MX additional details are open, include them in the copied text.
+  if (fieldKey === "mx") {
+    const mxDetails = document.getElementById("mxDetails");
+    if (mxDetails) {
+      const display = (window.getComputedStyle ? getComputedStyle(mxDetails).display : mxDetails.style.display);
+      if (display && display !== "none") {
+        const detailsText = (mxDetails.innerText || mxDetails.textContent || "").trim();
+        if (detailsText) {
+          text = (String(text || "").trimEnd() + "\n\n--- Additional Details ---\n" + detailsText).trim();
+        }
+      }
+    }
+  }
   if (!navigator.clipboard) {
     setStatus("Clipboard API not available in this browser.");
     return;
@@ -1642,6 +1678,19 @@ function card(title, value, label, cls, key, showCopy = true) {
 function toggleMxDetails(element) {
   const el = document.getElementById("mxDetails");
   if (!el) return;
+
+  // If the MX card is collapsed, expand it first and force details open.
+  const header = element && element.closest ? element.closest(".card-header") : null;
+  const content = header ? header.nextElementSibling : null;
+  const isCollapsed = !!(header && header.classList && header.classList.contains("collapsed-header")) ||
+                      !!(content && content.classList && content.classList.contains("collapsed"));
+  if (isCollapsed && header) {
+    toggleCard(header);
+    el.style.display = "block";
+    element.textContent = 'Additional Details -';
+    return;
+  }
+
   const current = el.style.display;
   const isOpen = (!current || current === "none");
   if (isOpen) {
@@ -1668,9 +1717,9 @@ function render(r) {
     // CHANGED: use &mdash; instead of literal em dash
     statusText = "TXT lookup failed &#x274C; &mdash; other DNS records may still resolve.";
   } else if (r.acsReady) {
-    statusText = "Done. ACS ready &#x2705;";
+    statusText = "Done. Ready to have domain verified with ACS &#x2705;";
   } else {
-    statusText = "Done. Not ready for ACS &#x274C;";
+    statusText = "Done. Not ready to have domain verified with ACS &#x274C;";
   }
 
   setStatus(statusText + buildTestSummaryHtml(r));
@@ -1709,8 +1758,8 @@ function render(r) {
   cards.push(card(
     "SPF (root TXT)",
     loaded.base ? r.spfValue : (baseError ? (errors.base || "Error") : "Loading..."),
-    basePending ? "LOADING" : (baseError ? "ERROR" : (r.spfPresent ? "PASS" : "MISSING")),
-    basePending ? "tag-info" : (baseError ? "tag-fail" : (r.spfPresent ? "tag-pass" : "tag-fail")),
+    basePending ? "LOADING" : (baseError ? "ERROR" : (r.spfPresent ? "PASS" : "OPTIONAL")),
+    basePending ? "tag-info" : (baseError ? "tag-fail" : (r.spfPresent ? "tag-pass" : "tag-info")),
     "spf"
   ));
 
@@ -1863,8 +1912,8 @@ function render(r) {
   cards.push(card(
     "DMARC",
     loaded.dmarc ? r.dmarc : (errors.dmarc ? errors.dmarc : "Loading..."),
-    (!loaded.dmarc && !errors.dmarc) ? "LOADING" : (errors.dmarc ? "ERROR" : (r.dmarc ? "PASS" : "MISSING")),
-    (!loaded.dmarc && !errors.dmarc) ? "tag-info" : (errors.dmarc ? "tag-fail" : (r.dmarc ? "tag-pass" : "tag-fail")),
+    (!loaded.dmarc && !errors.dmarc) ? "LOADING" : (errors.dmarc ? "ERROR" : (r.dmarc ? "PASS" : "OPTIONAL")),
+    (!loaded.dmarc && !errors.dmarc) ? "tag-info" : (errors.dmarc ? "tag-fail" : (r.dmarc ? "tag-pass" : "tag-info")),
     "dmarc"
   ));
 
@@ -1872,24 +1921,24 @@ function render(r) {
   cards.push(card(
     `DKIM1 (selector1-azurecomm-prod-net._domainkey.${r.domain || ""})`,
     loaded.dkim ? r.dkim1 : (errors.dkim ? errors.dkim : "Loading..."),
-    (!loaded.dkim && !errors.dkim) ? "LOADING" : (errors.dkim ? "ERROR" : (r.dkim1 ? "PASS" : "MISSING")),
-    (!loaded.dkim && !errors.dkim) ? "tag-info" : (errors.dkim ? "tag-fail" : (r.dkim1 ? "tag-pass" : "tag-fail")),
+    (!loaded.dkim && !errors.dkim) ? "LOADING" : (errors.dkim ? "ERROR" : (r.dkim1 ? "PASS" : "OPTIONAL")),
+    (!loaded.dkim && !errors.dkim) ? "tag-info" : (errors.dkim ? "tag-fail" : (r.dkim1 ? "tag-pass" : "tag-info")),
     "dkim1"
   ));
 
   cards.push(card(
     `DKIM2 (selector2-azurecomm-prod-net._domainkey.${r.domain || ""})`,
     loaded.dkim ? r.dkim2 : (errors.dkim ? errors.dkim : "Loading..."),
-    (!loaded.dkim && !errors.dkim) ? "LOADING" : (errors.dkim ? "ERROR" : (r.dkim2 ? "PASS" : "MISSING")),
-    (!loaded.dkim && !errors.dkim) ? "tag-info" : (errors.dkim ? "tag-fail" : (r.dkim2 ? "tag-pass" : "tag-fail")),
+    (!loaded.dkim && !errors.dkim) ? "LOADING" : (errors.dkim ? "ERROR" : (r.dkim2 ? "PASS" : "OPTIONAL")),
+    (!loaded.dkim && !errors.dkim) ? "tag-info" : (errors.dkim ? "tag-fail" : (r.dkim2 ? "tag-pass" : "tag-info")),
     "dkim2"
   ));
 
   cards.push(card(
     "CNAME",
     loaded.cname ? r.cname : (errors.cname ? errors.cname : "Loading..."),
-    (!loaded.cname && !errors.cname) ? "LOADING" : (errors.cname ? "ERROR" : "INFO"),
-    (!loaded.cname && !errors.cname) ? "tag-info" : (errors.cname ? "tag-fail" : "tag-info"),
+    (!loaded.cname && !errors.cname) ? "LOADING" : (errors.cname ? "ERROR" : (r.cname ? "PASS" : "OPTIONAL")),
+    (!loaded.cname && !errors.cname) ? "tag-info" : (errors.cname ? "tag-fail" : (r.cname ? "tag-pass" : "tag-info")),
     "cname"
   ));
 
