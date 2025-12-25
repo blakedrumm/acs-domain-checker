@@ -1,11 +1,39 @@
-# ==========================================
-# Azure Communication Services Domain Checker
-# + Extended DNS (MX, DMARC, DKIM, CNAME)
-# + Light/Dark Mode Toggle with Emojis
-# + Per-field Copy Buttons
-# + Page Screenshot-to-Clipboard (buttons hidden)
-# - UI + REST at http://localhost:8080
-# ==========================================
+<#!
+.SYNOPSIS
+  Local web UI + REST API to inspect DNS records used for Azure Communication Services (ACS) domain verification.
+
+.DESCRIPTION
+  Starts an HTTP listener (default: http://localhost:8080) that serves a single-page web UI and several JSON endpoints.
+  The tool helps validate whether a domain appears ready for ACS verification by checking for:
+  - Root TXT records (SPF + ms-domain-verification)
+  - MX records (with resolved IPv4/IPv6 addresses where available)
+  - DMARC, DKIM, and CNAME
+
+  Endpoints:
+  - /            : Web UI
+  - /dns         : Aggregated DNS status JSON
+  - /api/base    : Root TXT/SPF/ACS TXT JSON
+  - /api/mx      : MX (plus A/AAAA resolution details) JSON
+  - /api/dmarc   : DMARC JSON
+  - /api/dkim    : DKIM JSON
+  - /api/cname   : CNAME JSON
+
+.PARAMETER Port
+  TCP port to listen on. Default is 8080.
+
+.EXAMPLE
+  # Start on the default port
+  .\acs-domain-checker.ps1
+
+.EXAMPLE
+  # Start on a different port
+  .\acs-domain-checker.ps1 -Port 8090
+
+.NOTES
+  Author: Blake Drumm (blakedrumm@microsoft.com)
+  Date Created: December 24th, 2025
+  This script is intended for local troubleshooting. Ensure the chosen port is allowed by your firewall policy.
+#>
 
 param(
   [int]$Port = 8080
@@ -17,7 +45,7 @@ $listener = [System.Net.HttpListener]::new()
 $listener.Prefixes.Add("http://+:$Port/")
 $listener.Start()
 
-Write-Host "ACS Domain Verification Checker running at http://localhost:$Port"
+Write-Information -InformationAction Continue -MessageData "ACS Domain Verification Checker running at http://localhost:$Port"
 
 function Write-Json {
     param(
@@ -63,7 +91,43 @@ function ResolveSafely {
     }
 }
 
-function Normalize-Domain {
+function Get-DnsIpString {
+  param(
+    [Parameter(ValueFromPipeline = $true)]
+    [object]$Record
+  )
+
+  begin {
+    $results = [System.Collections.Generic.List[string]]::new()
+  }
+
+  process {
+    if ($null -eq $Record) { return }
+
+    $value = $null
+
+    # Resolve-DnsName outputs vary by PS/DnsClient version: IP4Address/IP6Address are common,
+    # and some versions expose an AliasProperty named IPAddress.
+    $props = $Record.PSObject.Properties
+    if ($props.Match('IPAddress').Count -gt 0) { $value = $Record.IPAddress }
+    elseif ($props.Match('IP4Address').Count -gt 0) { $value = $Record.IP4Address }
+    elseif ($props.Match('IP6Address').Count -gt 0) { $value = $Record.IP6Address }
+    elseif ($Record -is [System.Net.IPAddress]) { $value = $Record.ToString() }
+
+    foreach ($v in @($value)) {
+      $s = [string]$v
+      if (-not [string]::IsNullOrWhiteSpace($s)) {
+        $results.Add($s.Trim())
+      }
+    }
+  }
+
+  end {
+    $results | Select-Object -Unique
+  }
+}
+
+function ConvertTo-NormalizedDomain {
   param([string]$Raw)
 
   $domain = if ($null -eq $Raw) { "" } else { [string]$Raw }
@@ -81,7 +145,7 @@ function Normalize-Domain {
     try {
       $domain = ([Uri]$domain).Host
     } catch {
-      # ignore
+      $null = $_
     }
   }
 
@@ -135,9 +199,9 @@ function Write-RequestLog {
   }
 
   $netType = if ($isLocal) { "Local Network" } else { "Public Network" }
-  Write-Host "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $Action for '$Domain'" -ForegroundColor Cyan
-  Write-Host "  From: $remoteIp ($netType)" -ForegroundColor Gray
-  Write-Host "  Browser: $userAgent" -ForegroundColor DarkGray
+  Write-Information -InformationAction Continue -MessageData "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] $Action for '$Domain'"
+  Write-Information -InformationAction Continue -MessageData "  From: $remoteIp ($netType)"
+  Write-Information -InformationAction Continue -MessageData "  Browser: $userAgent"
 }
 
 function Get-DnsBaseStatus {
@@ -211,6 +275,11 @@ function Get-DnsMxStatus {
           $mxProviderHint = 'MX points to Google mail exchangers.'
           break
         }
+        '(^|\.)mx\.cloudflare\.net\.?$' {
+          $mxProvider = 'Cloudflare Email Routing'
+          $mxProviderHint = 'MX points to Cloudflare (mx.cloudflare.net).'
+          break
+        }
         'pphosted\.com\.?$' {
           $mxProvider = 'Proofpoint'
           $mxProviderHint = 'MX points to Proofpoint-hosted mail.'
@@ -240,10 +309,10 @@ function Get-DnsMxStatus {
       $ipv6 = @()
 
       if ($aRecs = ResolveSafely $m.NameExchange "A") {
-        $ipv4 += $aRecs | ForEach-Object { $_.IPAddress } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $ipv4 += $aRecs | Get-DnsIpString
       }
       if ($aaaaRecs = ResolveSafely $m.NameExchange "AAAA") {
-        $ipv6 += $aaaaRecs | ForEach-Object { $_.IPAddress } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        $ipv6 += $aaaaRecs | Get-DnsIpString
       }
 
       if (-not $ipv4 -and -not $ipv6) {
@@ -1902,7 +1971,7 @@ $domainLocks = [System.Collections.Concurrent.ConcurrentDictionary[string, Syste
 
 $functionNames = @(
   'Write-Json','Write-Html',
-  'ResolveSafely','Normalize-Domain','Test-DomainName','Write-RequestLog',
+  'ResolveSafely','Get-DnsIpString','ConvertTo-NormalizedDomain','Test-DomainName','Write-RequestLog',
   'Get-DnsBaseStatus','Get-DnsMxStatus','Get-DnsDmarcStatus','Get-DnsDkimStatus','Get-DnsCnameStatus',
   'Get-AcsDnsStatus'
 )
@@ -1918,11 +1987,11 @@ $pool.Open()
 
 $inflight = New-Object System.Collections.Generic.List[object]
 
-function Reap-Inflight {
+function Invoke-InflightCleanup {
   for ($i = $inflight.Count - 1; $i -ge 0; $i--) {
     $item = $inflight[$i]
     if ($item.Async.IsCompleted) {
-      try { $item.Ps.EndInvoke($item.Async) } catch {}
+      try { $item.Ps.EndInvoke($item.Async) } catch { $null = $_ }
       $item.Ps.Dispose()
       $inflight.RemoveAt($i)
     }
@@ -1955,7 +2024,7 @@ try {
 
   if ($path -in @("/api/base","/api/mx","/api/dmarc","/api/dkim","/api/cname")) {
     $domainRaw = $ctx.Request.QueryString["domain"]
-    $domain    = Normalize-Domain $domainRaw
+    $domain    = ConvertTo-NormalizedDomain $domainRaw
 
     Write-RequestLog -Context $ctx -Action "API $path" -Domain $domain
 
@@ -1988,7 +2057,7 @@ try {
 
   if ($path -eq "/dns") {
     $domainRaw = $ctx.Request.QueryString["domain"]
-    $domain    = Normalize-Domain $domainRaw
+    $domain    = ConvertTo-NormalizedDomain $domainRaw
 
     Write-RequestLog -Context $ctx -Action "DNS Lookup" -Domain $domain
 
@@ -2042,7 +2111,7 @@ try {
       $async = $ps.BeginInvoke()
       $inflight.Add([pscustomobject]@{ Ps = $ps; Async = $async })
 
-      Reap-Inflight
+      Invoke-InflightCleanup
     }
     catch [System.Net.HttpListenerException] {
       break
@@ -2050,12 +2119,12 @@ try {
   }
 }
 catch {
-  Write-Host "Error: $_"
+  Write-Error -ErrorRecord $_
 }
 finally {
-  try { if ($listener.IsListening) { $listener.Stop() } } catch {}
-  Reap-Inflight
-  foreach ($item in @($inflight)) { try { $item.Ps.Dispose() } catch {} }
-  try { $pool.Close(); $pool.Dispose() } catch {}
-  Write-Host "Server stopped."
+  try { if ($listener.IsListening) { $listener.Stop() } } catch { $null = $_ }
+  Invoke-InflightCleanup
+  foreach ($item in @($inflight)) { try { $item.Ps.Dispose() } catch { $null = $_ } }
+  try { $pool.Close(); $pool.Dispose() } catch { $null = $_ }
+  Write-Information -InformationAction Continue -MessageData "Server stopped."
 }
