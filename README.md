@@ -25,7 +25,7 @@ It serves a local UI and a small JSON API.
 
 Run:
 
-    pwsh -NoProfile -ExecutionPolicy Bypass -File .\acs-domain-checker.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\acs-domain-checker.ps1
 
 Open:
 
@@ -33,7 +33,7 @@ Open:
 
 To use a different port:
 
-    pwsh -NoProfile -ExecutionPolicy Bypass -File .\acs-domain-checker.ps1 -Port 8090
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\acs-domain-checker.ps1 -Port 8090
 
 ## API usage
 
