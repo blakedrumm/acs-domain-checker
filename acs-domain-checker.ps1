@@ -31,62 +31,245 @@
 
 .NOTES
   Author: Blake Drumm (blakedrumm@microsoft.com)
-  Date Created: December 24th, 2025
+  Date created: December 26th, 2025
   This script is intended for local troubleshooting. Ensure the chosen port is allowed by your firewall policy.
+
+  Cross-platform notes:
+  - On Linux/macOS, the listener binds to localhost only.
+  - If `Resolve-DnsName` is unavailable, DNS lookups fall back to DNS-over-HTTPS (DoH).
+    Override the DoH endpoint by setting `ACS_DNS_DOH_ENDPOINT` (default: Cloudflare).
 #>
 
 param(
-  [int]$Port = 8080
+  [int]$Port = 8080,
+  [ValidateSet('Auto','System','DoH')]
+  [string]$DnsResolver = 'Auto',
+  [string]$DohEndpoint
 )
 
 Add-Type -AssemblyName System.Net
 
-$listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://+:$Port/")
-$listener.Start()
+# ------------------- CONFIG / STARTUP -------------------
+# This script hosts a tiny local web server:
+# - `GET /` serves an embedded single-page HTML UI.
+# - `GET /api/*` returns individual DNS checks.
+# - `GET /dns` returns an aggregated "readiness" JSON payload.
+#
+# DNS resolver selection is exposed via `-DnsResolver`:
+# - Auto   : use `Resolve-DnsName` if available, else DoH.
+# - System : force `Resolve-DnsName` (Windows/PowerShell with DnsClient module).
+# - DoH    : force DNS-over-HTTPS via `Invoke-RestMethod`.
 
-Write-Information -InformationAction Continue -MessageData "ACS Domain Verification Checker running at http://localhost:$Port"
+$script:DnsResolverMode = $DnsResolver
+
+# RunspacePool copies function *definitions* but not script-scoped variables.
+# Use env vars for settings that must be visible inside request handler runspaces.
+$env:ACS_DNS_RESOLVER = $DnsResolver
+
+if ([string]::IsNullOrWhiteSpace($DohEndpoint)) {
+  if (-not [string]::IsNullOrWhiteSpace($env:ACS_DNS_DOH_ENDPOINT)) {
+    $DohEndpoint = $env:ACS_DNS_DOH_ENDPOINT
+  }
+}
+if (-not [string]::IsNullOrWhiteSpace($DohEndpoint)) {
+  $env:ACS_DNS_DOH_ENDPOINT = $DohEndpoint
+}
+
+$serverMode = 'HttpListener'
+$listener = $null
+$tcpListener = $null
+
+$displayUrl = "http://localhost:$Port"
+
+try {
+  $listener = [System.Net.HttpListener]::new()
+
+  # HttpListener on Windows supports wildcard prefixes (http://+:port/) which enables LAN access.
+  # On non-Windows, HttpListener support/permissions vary; bind to localhost to keep it simple.
+  $prefix = if ($IsWindows) { "http://+:$Port/" } else { "http://localhost:$Port/" }
+  $listener.Prefixes.Add($prefix)
+  $listener.Start()
+}
+catch {
+  # HttpListener is not consistently supported on Linux/macOS; fall back to a simple TcpListener server.
+  if (-not $IsWindows) {
+    $serverMode = 'TcpListener'
+  } else {
+    throw
+  }
+}
+
+if ($serverMode -eq 'TcpListener') {
+  $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+  $tcpListener.Start()
+}
+
+Write-Information -InformationAction Continue -MessageData "ACS Domain Verification Checker running at $displayUrl"
 
 function Write-Json {
     param(
-        [System.Net.HttpListenerContext]$Context,
+    $Context,
     [object]$Object,
     [int]$StatusCode = 200
     )
 
+    # Serialize to JSON and write to the current response type.
+    # The script can run in 2 server modes:
+    # - HttpListener: native `HttpListenerContext`/`HttpListenerResponse` objects
+    # - TcpListener : a minimal compatibility layer that mimics a subset of those APIs
     $json  = $Object | ConvertTo-Json -Depth 8
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
 
+  if ($Context.Response -is [System.Net.HttpListenerResponse]) {
     $Context.Response.ContentType = "application/json; charset=utf-8"
     $Context.Response.StatusCode  = $StatusCode
     $Context.Response.ContentLength64 = $bytes.Length
     $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
     $Context.Response.OutputStream.Close()
+    return
+  }
+
+  # TcpListener fallback response
+  $Context.Response.ContentType = "application/json; charset=utf-8"
+  $Context.Response.StatusCode  = $StatusCode
+  $Context.Response.ContentLength64 = $bytes.Length
+  $Context.Response.SendBody($bytes)
 }
 
 function Write-Html {
     param(
-        [System.Net.HttpListenerContext]$Context,
+        $Context,
         [string]$Html
     )
 
+    # Serve the embedded SPA HTML. (All dynamic data is fetched from JSON endpoints.)
     $bytes = [Text.Encoding]::UTF8.GetBytes($Html)
 
+    if ($Context.Response -is [System.Net.HttpListenerResponse]) {
+      $Context.Response.ContentType = "text/html; charset=utf-8"
+      $Context.Response.StatusCode  = 200
+      $Context.Response.ContentLength64 = $bytes.Length
+      $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+      $Context.Response.OutputStream.Close()
+      return
+    }
+
+    # TcpListener fallback response
     $Context.Response.ContentType = "text/html; charset=utf-8"
     $Context.Response.StatusCode  = 200
     $Context.Response.ContentLength64 = $bytes.Length
-    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Context.Response.OutputStream.Close()
+    $Context.Response.SendBody($bytes)
+}
+
+function Resolve-DohName {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Name,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('A','AAAA','CNAME','MX','TXT')]
+    [string]$Type
+  )
+
+  # DNS-over-HTTPS resolver.
+  # Returns objects shaped similarly to `Resolve-DnsName` output so downstream code can stay uniform.
+  $endpoint = $env:ACS_DNS_DOH_ENDPOINT
+  if ([string]::IsNullOrWhiteSpace($endpoint)) {
+    $endpoint = 'https://cloudflare-dns.com/dns-query'
+    $env:ACS_DNS_DOH_ENDPOINT = $endpoint
+  }
+
+  $uri = "{0}?name={1}&type={2}" -f $endpoint, ([uri]::EscapeDataString($Name)), $Type
+
+  # Cloudflare-style DoH JSON response (RFC 8484 compatible JSON format).
+  $resp = Invoke-RestMethod -Method Get -Uri $uri -Headers @{ accept = 'application/dns-json' } -TimeoutSec 10 -ErrorAction Stop
+  if ($null -eq $resp -or $null -eq $resp.Answer) { return $null }
+
+  $answers = @($resp.Answer)
+  if (-not $answers) { return $null }
+
+  switch ($Type) {
+    'TXT' {
+      foreach ($a in $answers) {
+        $data = [string]$a.data
+        if ([string]::IsNullOrWhiteSpace($data)) { continue }
+        $data = $data.Trim()
+        if ($data.StartsWith('"') -and $data.EndsWith('"') -and $data.Length -ge 2) {
+          $data = $data.Substring(1, $data.Length - 2)
+        }
+        $data = $data -replace '\\"','"'
+        [pscustomobject]@{ Strings = @($data) }
+      }
+    }
+    'MX' {
+      foreach ($a in $answers) {
+        $data = [string]$a.data
+        if ([string]::IsNullOrWhiteSpace($data)) { continue }
+        $parts = $data.Trim() -split '\s+', 2
+        if ($parts.Count -ne 2) { continue }
+        $pref = 0
+        [int]::TryParse($parts[0], [ref]$pref) | Out-Null
+        [pscustomobject]@{ Preference = $pref; NameExchange = $parts[1] }
+      }
+    }
+    'CNAME' {
+      foreach ($a in $answers) {
+        $data = [string]$a.data
+        if ([string]::IsNullOrWhiteSpace($data)) { continue }
+        [pscustomobject]@{ CanonicalName = $data.Trim() }
+      }
+    }
+    'A' {
+      foreach ($a in $answers) {
+        $data = [string]$a.data
+        if ([string]::IsNullOrWhiteSpace($data)) { continue }
+        [pscustomobject]@{ IPAddress = $data.Trim(); IP4Address = $data.Trim() }
+      }
+    }
+    'AAAA' {
+      foreach ($a in $answers) {
+        $data = [string]$a.data
+        if ([string]::IsNullOrWhiteSpace($data)) { continue }
+        [pscustomobject]@{ IPAddress = $data.Trim(); IP6Address = $data.Trim() }
+      }
+    }
+  }
 }
 
 function ResolveSafely {
     param(
         [string]$Name,
-        [string]$Type
+        [string]$Type,
+        [switch]$ThrowOnError
     )
+    # One stop DNS lookup wrapper:
+    # - picks System vs DoH vs Auto
+    # - optionally throws (when the caller wants to surface DNS failures)
     try {
-        Resolve-DnsName -Name $Name -Type $Type -ErrorAction Stop
+        $mode = $env:ACS_DNS_RESOLVER
+        if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'Auto' }
+
+        switch ($mode) {
+          'DoH' {
+            return (Resolve-DohName -Name $Name -Type $Type)
+          }
+          'System' {
+            $cmd = Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue
+            if (-not $cmd) {
+              throw "DnsResolver=System requires Resolve-DnsName (DnsClient module)."
+            }
+            return (Resolve-DnsName -Name $Name -Type $Type -ErrorAction Stop)
+          }
+          default {
+            # Auto
+            $cmd = Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue
+            if ($cmd) {
+              return (Resolve-DnsName -Name $Name -Type $Type -ErrorAction Stop)
+            }
+            return (Resolve-DohName -Name $Name -Type $Type)
+          }
+        }
     } catch {
+        if ($ThrowOnError) { throw }
         $null
     }
 }
@@ -130,6 +313,11 @@ function Get-DnsIpString {
 function ConvertTo-NormalizedDomain {
   param([string]$Raw)
 
+  # Normalize user input into a plain domain name:
+  # - accepts: domain, email address, or URL
+  # - strips: wildcard prefix and surrounding dots
+  # - outputs: lowercase domain
+
   $domain = if ($null -eq $Raw) { "" } else { [string]$Raw }
   $domain = $domain.Trim()
   if ([string]::IsNullOrWhiteSpace($domain)) { return "" }
@@ -159,6 +347,10 @@ function ConvertTo-NormalizedDomain {
 function Test-DomainName {
   param([string]$Domain)
 
+  # Lightweight validation to avoid:
+  # - obviously invalid domains
+  # - path/query injection through the query string
+
   if ([string]::IsNullOrWhiteSpace($Domain)) { return $false }
 
   $d = $Domain.Trim().ToLowerInvariant()
@@ -179,11 +371,12 @@ function Test-DomainName {
 
 function Write-RequestLog {
   param(
-    [System.Net.HttpListenerContext]$Context,
+    $Context,
     [string]$Action,
     [string]$Domain
   )
 
+  # Log incoming request context (useful when the listener is exposed on LAN on Windows).
   $userAgent = $Context.Request.UserAgent
   $remoteIp  = $Context.Request.RemoteEndPoint.Address.ToString()
   $isLocal   = $false
@@ -207,6 +400,10 @@ function Write-RequestLog {
 function Get-DnsBaseStatus {
   param([string]$Domain)
 
+  # Base/root TXT checks.
+  # - Collect all root TXT strings.
+  # - Detect SPF (v=spf1...) and ACS verification token (ms-domain-verification...).
+
   $spf        = $null
   $acsTxt     = $null
   $txtRecords = @()
@@ -214,7 +411,7 @@ function Get-DnsBaseStatus {
   $dnsError   = $null
 
   try {
-    $records = Resolve-DnsName -Name $Domain -Type TXT -ErrorAction Stop
+    $records = ResolveSafely $Domain "TXT" -ThrowOnError
     foreach ($r in $records) {
       $joined = ($r.Strings -join "").Trim()
       if ($joined) { $txtRecords += $joined }
@@ -250,6 +447,11 @@ function Get-DnsBaseStatus {
 
 function Get-DnsMxStatus {
   param([string]$Domain)
+
+  # MX checks.
+  # - Resolve MX records.
+  # - Guess the mail provider based on the lowest-preference MX host.
+  # - Resolve A/AAAA for each MX host to show concrete IP targets.
 
   $mxRecords         = @()
   $mxRecordsDetailed = @()
@@ -355,6 +557,8 @@ function Get-DnsMxStatus {
 function Get-DnsDmarcStatus {
   param([string]$Domain)
 
+  # DMARC is a TXT record at `_dmarc.<domain>`.
+
   $dmarc = $null
   if ($dm = ResolveSafely "_dmarc.$Domain" "TXT") {
     foreach ($r in $dm) {
@@ -368,6 +572,8 @@ function Get-DnsDmarcStatus {
 
 function Get-DnsDkimStatus {
   param([string]$Domain)
+
+  # ACS guidance expects these two DKIM selector TXT records.
 
   $dkim1 = $null
   if ($d1 = ResolveSafely "selector1-azurecomm-prod-net._domainkey.$Domain" "TXT") {
@@ -385,6 +591,8 @@ function Get-DnsDkimStatus {
 function Get-DnsCnameStatus {
   param([string]$Domain)
 
+  # Root CNAME check (not required for ACS verification; included as guidance).
+
   $cname = $null
   if ($cn = ResolveSafely $Domain "CNAME") {
     $cname = $cn.CanonicalName
@@ -395,6 +603,9 @@ function Get-DnsCnameStatus {
 
 function Get-AcsDnsStatus {
     param([string]$Domain)
+
+  # Aggregated status used by the UI.
+  # Combines the individual checks + generates human-friendly guidance strings.
 
   $base  = Get-DnsBaseStatus  -Domain $Domain
   $mx    = Get-DnsMxStatus    -Domain $Domain
@@ -438,6 +649,8 @@ function Get-AcsDnsStatus {
 
     [pscustomobject]@{
         domain     = $Domain
+      resolver   = $env:ACS_DNS_RESOLVER
+      dohEndpoint = $(if ($env:ACS_DNS_RESOLVER -eq 'DoH' -or ($env:ACS_DNS_RESOLVER -eq 'Auto' -and -not (Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue))) { $env:ACS_DNS_DOH_ENDPOINT } else { $null })
         dnsFailed  = $base.dnsFailed
         dnsError   = $base.dnsError
 
@@ -464,6 +677,10 @@ function Get-AcsDnsStatus {
 }
 
 # ------------------- HTML / UI -------------------
+# The UI is embedded as a here-string for easy, single-file distribution.
+# It calls the JSON endpoints in this script and renders results client-side.
+#
+# Note: The UI references a CDN script (`html2canvas`) only for screenshot/export.
 
 $htmlPage = @'
 <!DOCTYPE html>
@@ -633,6 +850,30 @@ button.primary:disabled {
   border-top: 1px solid var(--border);
 }
 
+.status-header {
+  width: 100%;
+  margin: 0 0 10px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  text-align: center;
+}
+
+.status-header .title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg);
+}
+
+.status-header .hint {
+  font-size: 12px;
+  color: var(--status);
+}
+
 .status-summary {
   display: flex;
   flex-direction: column;
@@ -652,6 +893,14 @@ button.primary:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.status-pills {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .status-name {
@@ -952,6 +1201,8 @@ ul.guidance li {
 let lastResult = null;
 const HISTORY_KEY = "acsDomainHistory";
 
+let screenshotStatusToken = 0;
+
 let activeLookup = { runId: 0, controllers: [] };
 
 function cancelInflightLookup() {
@@ -1228,7 +1479,7 @@ function buildTestSummaryHtml(r) {
   };
 
   const checks = [];
-  const add = (name, state) => checks.push({ name, state });
+  const add = (name, state, isOptional = false) => checks.push({ name, state, isOptional });
 
   // ACS Readiness (derived from base)
   if (!loaded.base && !errors.base) {
@@ -1260,13 +1511,14 @@ function buildTestSummaryHtml(r) {
     add("ACS TXT", "error");
     add("TXT Records", "error");
   } else if (r.dnsFailed) {
-    add("SPF (root TXT)", "unavailable");
+    add("SPF (root TXT)", "unavailable", true);
     add("ACS TXT", "fail");
-    add("TXT Records", "fail");
+    add("TXT Records", "unavailable", true);
   } else {
-    add("SPF (root TXT)", r.spfPresent ? "pass" : "optional");
+    add("SPF (root TXT)", r.spfPresent ? "pass" : "fail", true);
     add("ACS TXT", r.acsPresent ? "pass" : "fail");
-    add("TXT Records", "pass");
+    const hasTxt = Array.isArray(r.txtRecords) && r.txtRecords.length > 0;
+    add("TXT Records", hasTxt ? "pass" : "fail", true);
   }
 
   // MX
@@ -1276,7 +1528,7 @@ function buildTestSummaryHtml(r) {
     add("MX", "error");
   } else {
     const hasMx = Array.isArray(r.mxRecords) && r.mxRecords.length > 0;
-    add("MX", hasMx ? "pass" : "optional");
+    add("MX", hasMx ? "pass" : "fail", true);
   }
 
   // DMARC
@@ -1285,7 +1537,7 @@ function buildTestSummaryHtml(r) {
   } else if (errors.dmarc) {
     add("DMARC", "error");
   } else {
-    add("DMARC", r.dmarc ? "pass" : "optional");
+    add("DMARC", r.dmarc ? "pass" : "fail", true);
   }
 
   // DKIM selectors
@@ -1296,8 +1548,8 @@ function buildTestSummaryHtml(r) {
     add("DKIM1", "error");
     add("DKIM2", "error");
   } else {
-    add("DKIM1", r.dkim1 ? "pass" : "optional");
-    add("DKIM2", r.dkim2 ? "pass" : "optional");
+    add("DKIM1", r.dkim1 ? "pass" : "fail", true);
+    add("DKIM2", r.dkim2 ? "pass" : "fail", true);
   }
 
   // CNAME
@@ -1306,16 +1558,26 @@ function buildTestSummaryHtml(r) {
   } else if (errors.cname) {
     add("CNAME", "error");
   } else {
-    add("CNAME", r.cname ? "pass" : "optional");
+    add("CNAME", r.cname ? "pass" : "fail", true);
   }
 
   const pills = checks.map(c => {
     const name = escapeHtml(c.name);
     const status = escapeHtml(String(c.state).toUpperCase());
-    return `<div class="status-row"><span class="status-name">${name}</span><span class="tag ${classForState(c.state)} status-pill">${status}</span></div>`;
+    const optionalBadge = c.isOptional ? `<span class="tag ${classForState('optional')} status-pill">OPTIONAL</span>` : "";
+    return `<div class="status-row"><span class="status-name">${name}</span><span class="status-pills">${optionalBadge}<span class="tag ${classForState(c.state)} status-pill">${status}</span></span></div>`;
   });
 
-  return `<div class="status-divider"></div><div class="status-summary">${pills.join("")}</div>`;
+  return `
+    <div class="status-divider"></div>
+    <div class="status-summary">
+      <div class="status-header">
+        <div class="title">Check Summary</div>
+        <div class="hint">Only <strong>ACS TXT</strong> is required for ACS domain verification. Items marked <strong>OPTIONAL</strong> are best-practice checks.</div>
+      </div>
+      ${pills.join("")}
+    </div>
+  `;
 }
 
 function applyTheme(theme) {
@@ -1418,6 +1680,10 @@ function screenshotPage() {
     return;
   }
 
+  const statusEl = document.getElementById("status");
+  const previousStatusHtml = statusEl ? statusEl.innerHTML : "";
+  const myToken = ++screenshotStatusToken;
+
   // Capture only the container div instead of the entire body
   const container = document.querySelector(".container");
   if (!container) {
@@ -1442,11 +1708,12 @@ function screenshotPage() {
         .then(() => {
           setStatus("Screenshot copied to clipboard.");
           setTimeout(() => {
-            const statusEl = document.getElementById("status");
-            if (statusEl && statusEl.innerHTML === "Screenshot copied to clipboard.") {
-              statusEl.innerHTML = "";
+            if (myToken !== screenshotStatusToken) return;
+            const el = document.getElementById("status");
+            if (el && el.innerHTML === "Screenshot copied to clipboard.") {
+              el.innerHTML = previousStatusHtml;
             }
-          }, 10000);
+          }, 2500);
         })
         .catch(() => setStatus("Failed to copy screenshot to clipboard."));
     });
@@ -2013,20 +2280,26 @@ window.addEventListener("load", function () {
 '@
 
 # ------------------- MAIN LOOP -------------------
+# Request handling uses a RunspacePool to process multiple HTTP requests concurrently.
+# This keeps the UI responsive while DNS lookups are in flight.
 
-$maxConcurrentRequests = 16
+$maxConcurrentRequests = 64
+
+# Per-domain throttling: only one lookup per domain at a time.
+# This prevents a single browser from hammering DNS (e.g., repeated refreshes) for the same domain.
 
 $domainLocks = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Threading.SemaphoreSlim]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 $functionNames = @(
   'Write-Json','Write-Html',
-  'ResolveSafely','Get-DnsIpString','ConvertTo-NormalizedDomain','Test-DomainName','Write-RequestLog',
+  'Resolve-DohName','ResolveSafely','Get-DnsIpString','ConvertTo-NormalizedDomain','Test-DomainName','Write-RequestLog',
   'Get-DnsBaseStatus','Get-DnsMxStatus','Get-DnsDmarcStatus','Get-DnsDkimStatus','Get-DnsCnameStatus',
   'Get-AcsDnsStatus'
 )
 
 $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 foreach ($name in $functionNames) {
+  # Copy function *definitions* into the runspace pool so handler runspaces can call them.
   $def = (Get-Command $name -CommandType Function -ErrorAction Stop).Definition
   $iss.Commands.Add([System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($name, $def))
 }
@@ -2037,6 +2310,7 @@ $pool.Open()
 $inflight = New-Object System.Collections.Generic.List[object]
 
 function Invoke-InflightCleanup {
+  # Reap completed async PowerShell invocations to avoid unbounded memory growth.
   for ($i = $inflight.Count - 1; $i -ge 0; $i--) {
     $item = $inflight[$i]
     if ($item.Async.IsCompleted) {
@@ -2052,7 +2326,14 @@ param($ctx, $htmlPage, $domainLocks)
 
 $path = $ctx.Request.Url.AbsolutePath
 
+# This script block runs inside the RunspacePool for each incoming request.
+# Inputs:
+# - $ctx         : the request/response context (HttpListenerContext or TcpListener shim)
+# - $htmlPage    : the embedded SPA HTML (string)
+# - $domainLocks : shared dictionary of per-domain semaphores
+
 function Get-DomainSemaphore([string]$domain) {
+  # Get/create a per-domain semaphore so concurrent requests for the same domain serialize.
   $sem = $null
   if (-not $domainLocks.TryGetValue($domain, [ref]$sem)) {
     $newSem = [System.Threading.SemaphoreSlim]::new(1, 1)
@@ -2066,11 +2347,13 @@ function Get-DomainSemaphore([string]$domain) {
 }
 
 try {
+  # 1) Serve the UI
   if ($path -eq "/" -or $path -eq "/index.html") {
     Write-Html -Context $ctx -Html $htmlPage
     return
   }
 
+  # 2) Serve individual API endpoints (/api/*)
   if ($path -in @("/api/base","/api/mx","/api/dmarc","/api/dkim","/api/cname")) {
     $domainRaw = $ctx.Request.QueryString["domain"]
     $domain    = ConvertTo-NormalizedDomain $domainRaw
@@ -2086,6 +2369,7 @@ try {
       return
     }
 
+    # Serialize work for this domain, do the lookup, then release.
     $sem = Get-DomainSemaphore -domain $domain
     $null = $sem.Wait()
     try {
@@ -2104,6 +2388,7 @@ try {
     return
   }
 
+  # 3) Serve the aggregated endpoint used by the UI (/dns)
   if ($path -eq "/dns") {
     $domainRaw = $ctx.Request.QueryString["domain"]
     $domain    = ConvertTo-NormalizedDomain $domainRaw
@@ -2119,6 +2404,7 @@ try {
       return
     }
 
+    # Serialize work for this domain, do the lookup, then release.
     $sem = Get-DomainSemaphore -domain $domain
     $null = $sem.Wait()
     try {
@@ -2136,34 +2422,221 @@ try {
   $ctx.Response.Close()
 }
 catch {
+  # Last-resort error handler: attempt to return a JSON error payload.
   try { Write-Json -Context $ctx -Object @{ error = $_.Exception.Message } -StatusCode 500 } catch {}
   try { $ctx.Response.Close() } catch {}
 }
 '@
 
 try {
-  while ($listener.IsListening) {
-    try {
-      $contextTask = $listener.GetContextAsync()
-      while (-not $contextTask.AsyncWaitHandle.WaitOne(200)) {
+  function ConvertFrom-QueryString {
+    param([string]$Query)
+    # Minimal query-string parser used by the TcpListener fallback.
+    $nvc = [System.Collections.Specialized.NameValueCollection]::new()
+    if ([string]::IsNullOrWhiteSpace($Query)) { return $nvc }
+    $q = $Query.TrimStart('?')
+    if ([string]::IsNullOrWhiteSpace($q)) { return $nvc }
+    foreach ($pair in ($q -split '&')) {
+      if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+      $kv = $pair -split '=', 2
+      $k = ($kv[0] -replace '\+',' ')
+      $k = [uri]::UnescapeDataString($k)
+      $v = ''
+      if ($kv.Count -gt 1) {
+        $v = ($kv[1] -replace '\+',' ')
+        $v = [uri]::UnescapeDataString($v)
+      }
+      $nvc.Add($k, $v)
+    }
+    return $nvc
+  }
+
+  function New-TcpContext {
+    param(
+      [Parameter(Mandatory = $true)]
+      [System.Net.Sockets.TcpClient]$Client,
+      [Parameter(Mandatory = $true)]
+      [string]$RawTarget,
+      [Parameter(Mandatory = $true)]
+      [hashtable]$Headers
+    )
+
+    $remote = $Client.Client.RemoteEndPoint
+    $ua = if ($Headers.ContainsKey('user-agent')) { [string]$Headers['user-agent'] } else { $null }
+
+    $pathOnly = $RawTarget
+    $query = ''
+    $qm = $RawTarget.IndexOf('?')
+    if ($qm -ge 0) {
+      $pathOnly = $RawTarget.Substring(0, $qm)
+      $query = $RawTarget.Substring($qm)
+    }
+
+    $url = [uri]::new("http://localhost:$Port$pathOnly$query")
+    $qs = ConvertFrom-QueryString -Query $query
+
+    $networkStream = $Client.GetStream()
+
+    # TcpListener fallback response object.
+    # It exposes a subset of `HttpListenerResponse`-like properties and a `SendBody()` method.
+    $resp = [pscustomobject]@{
+      StatusCode = 200
+      StatusDescription = 'OK'
+      ContentType = 'text/plain; charset=utf-8'
+      ContentLength64 = [int64]0
+      _client = $Client
+      _stream = $networkStream
+      _sent = $false
+    }
+
+    $resp | Add-Member -MemberType ScriptMethod -Name SendBody -Value {
+      param([byte[]]$Bytes)
+      if ($this._sent) {
+        try { $this._client.Close() } catch { }
+        return
+      }
+
+      $statusText = if ([string]::IsNullOrWhiteSpace($this.StatusDescription)) { 'OK' } else { $this.StatusDescription }
+      $headers = "HTTP/1.1 {0} {1}\r\nContent-Type: {2}\r\nContent-Length: {3}\r\nConnection: close\r\n\r\n" -f $this.StatusCode, $statusText, $this.ContentType, $Bytes.Length
+      $headerBytes = [Text.Encoding]::ASCII.GetBytes($headers)
+
+      try {
+        $this._stream.Write($headerBytes, 0, $headerBytes.Length)
+        if ($Bytes.Length -gt 0) {
+          $this._stream.Write($Bytes, 0, $Bytes.Length)
+        }
+        $this._stream.Flush()
+      } finally {
+        $this._sent = $true
+        try { $this._stream.Dispose() } catch { }
+        try { $this._client.Close() } catch { }
+      }
+    } | Out-Null
+
+    $resp | Add-Member -MemberType ScriptMethod -Name Close -Value {
+      if ($this._sent) {
+        try { $this._client.Close() } catch { }
+        return
+      }
+      $this.SendBody([byte[]]@())
+    } | Out-Null
+
+    $req = [pscustomobject]@{
+      Url = $url
+      QueryString = $qs
+      UserAgent = $ua
+      RemoteEndPoint = $remote
+    }
+
+    return [pscustomobject]@{ Request = $req; Response = $resp }
+  }
+
+  function Read-TcpHttpRequest {
+    param(
+      [Parameter(Mandatory = $true)]
+      [System.Net.Sockets.TcpClient]$Client
+    )
+
+    # Extremely small HTTP/1.1 request reader (GET only).
+    # We only need the request line + headers to route GET requests and read query strings.
+    $stream = $Client.GetStream()
+    $reader = [System.IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 8192, $true)
+    $line1 = $reader.ReadLine()
+    if ([string]::IsNullOrWhiteSpace($line1)) { return $null }
+
+    $parts = $line1 -split '\s+'
+    if ($parts.Count -lt 2) { return $null }
+
+    $method = $parts[0].Trim().ToUpperInvariant()
+    $target = $parts[1].Trim()
+
+    $headers = @{}
+    while ($true) {
+      $line = $reader.ReadLine()
+      if ($null -eq $line) { break }
+      if ($line -eq '') { break }
+      $idx = $line.IndexOf(':')
+      if ($idx -le 0) { continue }
+      $hName = $line.Substring(0, $idx).Trim().ToLowerInvariant()
+      $hValue = $line.Substring($idx + 1).Trim()
+      $headers[$hName] = $hValue
+    }
+
+    return [pscustomobject]@{ Method = $method; Target = $target; Headers = $headers }
+  }
+
+  if ($serverMode -eq 'HttpListener') {
+    # Primary server mode: HttpListener (best supported on Windows).
+    while ($listener.IsListening) {
+      try {
+        $contextTask = $listener.GetContextAsync()
+        while (-not $contextTask.AsyncWaitHandle.WaitOne(200)) {
+          # allow Ctrl+C / stop processing
+        }
+
+        if (-not $listener.IsListening) { break }
+
+        $ctx = $contextTask.GetAwaiter().GetResult()
+
+        # Run the handler in the RunspacePool so multiple requests can be processed concurrently.
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $pool
+        $null = $ps.AddScript($handlerScript).AddArgument($ctx).AddArgument($htmlPage).AddArgument($domainLocks)
+
+        $async = $ps.BeginInvoke()
+        $inflight.Add([pscustomobject]@{ Ps = $ps; Async = $async })
+
+        Invoke-InflightCleanup
+      }
+      catch [System.Net.HttpListenerException] {
+        break
+      }
+    }
+  }
+  else {
+    # Fallback server mode: TcpListener (for platforms where HttpListener is unavailable).
+    # Only GET is supported here; it's enough for the SPA + JSON endpoints.
+    while ($true) {
+      $acceptTask = $tcpListener.AcceptTcpClientAsync()
+      while (-not $acceptTask.AsyncWaitHandle.WaitOne(200)) {
         # allow Ctrl+C / stop processing
       }
 
-      if (-not $listener.IsListening) { break }
+      $client = $acceptTask.GetAwaiter().GetResult()
+      if ($null -eq $client) { continue }
 
-      $ctx = $contextTask.GetAwaiter().GetResult()
+      $req = $null
+      try {
+        $req = Read-TcpHttpRequest -Client $client
+        if ($null -eq $req) {
+          try { $client.Close() } catch { }
+          continue
+        }
 
-      $ps = [PowerShell]::Create()
-      $ps.RunspacePool = $pool
-      $null = $ps.AddScript($handlerScript).AddArgument($ctx).AddArgument($htmlPage).AddArgument($domainLocks)
+        if ($req.Method -ne 'GET') {
+          $ctx = New-TcpContext -Client $client -RawTarget ($req.Target) -Headers $req.Headers
+          $ctx.Response.StatusCode = 405
+          $ctx.Response.StatusDescription = 'Method Not Allowed'
+          $ctx.Response.ContentType = 'text/plain; charset=utf-8'
+          $ctx.Response.SendBody([Text.Encoding]::UTF8.GetBytes('Method Not Allowed'))
+          continue
+        }
 
-      $async = $ps.BeginInvoke()
-      $inflight.Add([pscustomobject]@{ Ps = $ps; Async = $async })
+        $ctx = New-TcpContext -Client $client -RawTarget ($req.Target) -Headers $req.Headers
 
-      Invoke-InflightCleanup
-    }
-    catch [System.Net.HttpListenerException] {
-      break
+        # Run the same handler script used by HttpListener.
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $pool
+        $null = $ps.AddScript($handlerScript).AddArgument($ctx).AddArgument($htmlPage).AddArgument($domainLocks)
+
+        $async = $ps.BeginInvoke()
+        $inflight.Add([pscustomobject]@{ Ps = $ps; Async = $async })
+
+        Invoke-InflightCleanup
+      }
+      catch {
+        try { $client.Close() } catch { }
+      }
     }
   }
 }
@@ -2171,7 +2644,9 @@ catch {
   Write-Error -ErrorRecord $_
 }
 finally {
-  try { if ($listener.IsListening) { $listener.Stop() } } catch { $null = $_ }
+  # Graceful shutdown: stop listeners and dispose runspaces.
+  try { if ($listener -and $listener.IsListening) { $listener.Stop() } } catch { $null = $_ }
+  try { if ($tcpListener) { $tcpListener.Stop() } } catch { $null = $_ }
   Invoke-InflightCleanup
   foreach ($item in @($inflight)) { try { $item.Ps.Dispose() } catch { $null = $_ } }
   try { $pool.Close(); $pool.Dispose() } catch { $null = $_ }
