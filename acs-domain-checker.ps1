@@ -31,7 +31,6 @@
 
 .NOTES
   Author: Blake Drumm (blakedrumm@microsoft.com)
-  Date created: December 26th, 2025
   This script is intended for local troubleshooting. Ensure the chosen port is allowed by your firewall policy.
 
   Cross-platform notes:
@@ -41,13 +40,26 @@
 #>
 
 param(
-  [int]$Port = 8080,
+  [int]$Port = $(if ($env:PORT -and $env:PORT -match '^\d+$') { [int]$env:PORT } else { 8080 }),
   [ValidateSet('Auto','System','DoH')]
   [string]$DnsResolver = 'Auto',
-  [string]$DohEndpoint
+  [string]$DohEndpoint,
+  # Listener binding mode:
+  # - Auto      : preserve current behavior (Windows = all interfaces, non-Windows = localhost)
+  # - Localhost : bind only to loopback (safest for local troubleshooting)
+  # - Any       : bind to all interfaces (required for most container scenarios)
+  [ValidateSet('Auto','Localhost','Any')]
+  [string]$Bind = 'Auto'
 )
 
 Add-Type -AssemblyName System.Net
+
+# Heuristic: when running in Container Apps / Kubernetes on non-Windows, we generally must bind to all interfaces.
+$script:IsContainer = (
+  -not [string]::IsNullOrWhiteSpace($env:CONTAINER_APP_NAME) -or
+  -not [string]::IsNullOrWhiteSpace($env:CONTAINER_APP_REVISION) -or
+  -not [string]::IsNullOrWhiteSpace($env:KUBERNETES_SERVICE_HOST)
+)
 
 # ------------------- CONFIG / STARTUP -------------------
 # This script hosts a tiny local web server:
@@ -84,9 +96,20 @@ $displayUrl = "http://localhost:$Port"
 try {
   $listener = [System.Net.HttpListener]::new()
 
-  # HttpListener on Windows supports wildcard prefixes (http://+:port/) which enables LAN access.
-  # On non-Windows, HttpListener support/permissions vary; bind to localhost to keep it simple.
-  $prefix = if ($IsWindows) { "http://+:$Port/" } else { "http://localhost:$Port/" }
+  # Choose the listener prefix based on the requested binding mode.
+  # - On Windows, `+` is commonly used for "all interfaces".
+  # - Cross-platform, `*` is the most portable wildcard hostname in HttpListener prefixes.
+  # - `localhost` is loopback-only.
+  $prefix = switch ($Bind) {
+    'Localhost' { "http://localhost:$Port/" }
+    'Any'       { if ($IsWindows) { "http://+:$Port/" } else { "http://*:$Port/" } }
+    default     {
+      # Auto: keep the original behavior.
+      if ($IsWindows) { "http://+:$Port/" }
+      elseif ($script:IsContainer) { "http://*:$Port/" }
+      else { "http://localhost:$Port/" }
+    }
+  }
   $listener.Prefixes.Add($prefix)
   $listener.Start()
 }
@@ -100,7 +123,12 @@ catch {
 }
 
 if ($serverMode -eq 'TcpListener') {
-  $tcpListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+  # TcpListener fallback should match the binding intent:
+  # - Localhost/Auto -> loopback only
+  # - Any            -> all interfaces (0.0.0.0)
+  $effectiveAny = ($Bind -eq 'Any') -or (($Bind -eq 'Auto') -and (-not $IsWindows) -and $script:IsContainer)
+  $bindAddress = if ($effectiveAny) { [System.Net.IPAddress]::Any } else { [System.Net.IPAddress]::Loopback }
+  $tcpListener = [System.Net.Sockets.TcpListener]::new($bindAddress, $Port)
   $tcpListener.Start()
 }
 
