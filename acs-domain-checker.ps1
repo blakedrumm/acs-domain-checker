@@ -616,14 +616,58 @@ function Get-DnsDkimStatus {
   [pscustomobject]@{ domain = $Domain; dkim1 = $dkim1; dkim2 = $dkim2 }
 }
 
+function Get-CnameTargetFromRecords {
+  param(
+    [Parameter(ValueFromPipeline = $true)]
+    [object]$Records
+  )
+
+  foreach ($r in @($Records)) {
+    if ($null -eq $r) { continue }
+
+    $props = $r.PSObject.Properties
+
+    # `Resolve-DnsName -Type CNAME` may return SOA in the Authority section when no CNAME exists.
+    # Only treat actual CNAME records as a match.
+    $typeValue = $null
+    if ($props.Match('Type').Count -gt 0) { $typeValue = $r.Type }
+    elseif ($props.Match('TypeName').Count -gt 0) { $typeValue = $r.TypeName }
+    elseif ($props.Match('QueryType').Count -gt 0) { $typeValue = $r.QueryType }
+
+    $typeString = [string]$typeValue
+    if (-not [string]::IsNullOrWhiteSpace($typeString) -and $typeString -ne 'CNAME') {
+      continue
+    }
+
+    $target = $null
+    if ($props.Match('CanonicalName').Count -gt 0) { $target = $r.CanonicalName }
+    elseif ($props.Match('NameHost').Count -gt 0) { $target = $r.NameHost }
+    elseif ($props.Match('NameTarget').Count -gt 0) { $target = $r.NameTarget }
+    elseif ($props.Match('Target').Count -gt 0) { $target = $r.Target }
+
+    $targetString = [string]$target
+    if ([string]::IsNullOrWhiteSpace($targetString)) { continue }
+
+    return $targetString.Trim().TrimEnd('.')
+  }
+
+  return $null
+}
+
 function Get-DnsCnameStatus {
   param([string]$Domain)
 
   # Root CNAME check (not required for ACS verification; included as guidance).
 
   $cname = $null
-  if ($cn = ResolveSafely $Domain "CNAME") {
-    $cname = $cn.CanonicalName
+
+  $lookupNames = if ($Domain -match '^(?i)www\.') { @($Domain) } else { @($Domain, "www.$Domain") }
+  foreach ($name in $lookupNames) {
+    $target = Get-CnameTargetFromRecords (ResolveSafely $name 'CNAME')
+    if (-not [string]::IsNullOrWhiteSpace($target)) {
+      $cname = $target
+      break
+    }
   }
 
   [pscustomobject]@{ domain = $Domain; cname = $cname }
@@ -657,7 +701,7 @@ function Get-AcsDnsStatus {
       if (-not $dmarc.dmarc)     { $guidance.Add("DMARC is missing. Add a _dmarc.$Domain TXT record to reduce spoofing risk.") }
       if (-not $dkim.dkim1)      { $guidance.Add("DKIM selector1 (selector1-azurecomm-prod-net) is missing.") }
       if (-not $dkim.dkim2)      { $guidance.Add("DKIM selector2 (selector2-azurecomm-prod-net) is missing.") }
-      if (-not $cname.cname)     { $guidance.Add("Root CNAME is not configured. Validate this is expected for your scenario.") }
+      if (-not $cname.cname)     { $guidance.Add("CNAME is not configured (root or www). Validate this is expected for your scenario.") }
 
       # Provider-aware hints
       if ($mx.mxProvider -and $mx.mxProvider -ne 'Unknown') {
@@ -2232,8 +2276,8 @@ function render(r) {
   cards.push(card(
     "CNAME",
     loaded.cname ? r.cname : (errors.cname ? errors.cname : "Loading..."),
-    (!loaded.cname && !errors.cname) ? "LOADING" : (errors.cname ? "ERROR" : (r.cname ? "PASS" : "OPTIONAL")),
-    (!loaded.cname && !errors.cname) ? "tag-info" : (errors.cname ? "tag-fail" : (r.cname ? "tag-pass" : "tag-info")),
+    (!loaded.cname && !errors.cname) ? "LOADING" : (errors.cname ? "ERROR" : (r.cname ? "PASS" : "FAIL")),
+    (!loaded.cname && !errors.cname) ? "tag-info" : (errors.cname ? "tag-fail" : (r.cname ? "tag-pass" : "tag-fail")),
     "cname"
   ));
 
@@ -2321,7 +2365,7 @@ $domainLocks = [System.Collections.Concurrent.ConcurrentDictionary[string, Syste
 $functionNames = @(
   'Write-Json','Write-Html',
   'Resolve-DohName','ResolveSafely','Get-DnsIpString','ConvertTo-NormalizedDomain','Test-DomainName','Write-RequestLog',
-  'Get-DnsBaseStatus','Get-DnsMxStatus','Get-DnsDmarcStatus','Get-DnsDkimStatus','Get-DnsCnameStatus',
+  'Get-DnsBaseStatus','Get-DnsMxStatus','Get-DnsDmarcStatus','Get-DnsDkimStatus','Get-CnameTargetFromRecords','Get-DnsCnameStatus',
   'Get-AcsDnsStatus'
 )
 
